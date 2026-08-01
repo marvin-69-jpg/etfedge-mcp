@@ -44,6 +44,86 @@ def test_table_safety_helpers():
     assert mcp_tools._limit(0) == 100
 
 
+def test_instrument_filter_defaults_to_equity():
+    assert mcp_tools._instrument_filter("s", None) == (
+        "s.instrument_type = :itype",
+        {"itype": "equity"},
+    )
+    assert mcp_tools._instrument_filter("", "BOND") == (
+        "instrument_type = :itype",
+        {"itype": "bond"},
+    )
+    assert mcp_tools._instrument_filter("s", "all") == ("TRUE", {})
+    _raises(
+        lambda: mcp_tools._instrument_filter("s", "stock_code = '1' OR 1=1"),
+        "instrument_type must be one of",
+    )
+
+
+class _Rows(list):
+    def first(self):
+        return self[0] if self else None
+
+
+class _RecordingConn:
+    """Fake connection: records every statement, returns canned rows."""
+
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, sql, params=None):
+        sql = str(sql)
+        self.statements.append((sql, params or {}))
+        if "max(trade_date) AS d FROM shares" in sql:
+            return _Rows([(date(2026, 4, 30),)])
+        if "SELECT coalesce(" in sql:
+            return _Rows([("Test ETF",)])
+        return _Rows()
+
+    def stmt(self, needle):
+        for sql, params in self.statements:
+            if needle in sql:
+                return sql, params
+        raise AssertionError(f"no statement containing {needle!r}")
+
+
+def test_position_tools_filter_non_equity_by_default():
+    conn = _RecordingConn()
+    mcp_tools.get_etf_buy_delta(conn, "00981A", "2026-01-01", "2026-02-01")
+    sql, params = conn.stmt("start_snap")
+    assert "instrument_type = :itype" in sql
+    assert params["itype"] == "equity"
+
+    conn = _RecordingConn()
+    mcp_tools.get_consensus_buys(conn, "2026-01-01", "2026-02-01")
+    assert "s.instrument_type = 'equity'" in conn.stmt("per_etf_end")[0]
+
+    conn = _RecordingConn()
+    result = mcp_tools.get_etf_holdings(conn, "00981A")
+    sql, params = conn.stmt("value_yi")
+    assert "s.instrument_type = :itype" in sql
+    assert params["itype"] == "equity"
+    assert result["instrument_type"] == "equity"
+    assert result["as_of"] == "2026-04-30"
+    # excluded types are reported so a bond ETF's empty equity book is explainable
+    assert "instrument_type <> :itype" in conn.stmt("instrument_type <> :itype")[0]
+
+    conn = _RecordingConn()
+    mcp_tools.get_etf_holdings(conn, "00980D", instrument_type="all")
+    assert "TRUE" in conn.stmt("value_yi")[0]
+    assert conn.stmt("value_yi")[1] == {"etf": "00980D", "as_of": date(2026, 4, 30)}
+
+
+def test_shares_and_holdings_expose_instrument_type_column():
+    for table in ("shares", "holdings"):
+        assert mcp_tools._column(table, "instrument_type") == "instrument_type"
+    where, params = mcp_tools._where(
+        "shares", [{"column": "instrument_type", "op": "eq", "value": "equity"}]
+    )
+    assert where == "WHERE instrument_type = :v0"
+    assert params == {"v0": "equity"}
+
+
 def test_query_table_uses_safe_sql_parts():
     conn = _Conn()
     assert mcp_tools.query_table(
@@ -132,6 +212,9 @@ def test_unrealized_pnl_estimate_uses_latest_non_null_close():
 
 if __name__ == "__main__":
     test_table_safety_helpers()
+    test_instrument_filter_defaults_to_equity()
+    test_position_tools_filter_non_equity_by_default()
+    test_shares_and_holdings_expose_instrument_type_column()
     test_query_table_uses_safe_sql_parts()
     test_unrealized_pnl_estimate_weighted_average()
     test_unrealized_pnl_estimate_uses_latest_non_null_close()

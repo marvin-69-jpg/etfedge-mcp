@@ -507,6 +507,10 @@ def query_table(
             [{"column": "etf_code", "op": "eq", "value": "00981A"}].
             Supported ops: eq, ne, lt, lte, gt, gte, like, ilike, in.
             `prices` requires a filter on stock_code or trade_date.
+            `shares`/`holdings` mix listed stocks with bonds, index
+            futures/options, cash and FX markers — add
+            {"column": "instrument_type", "op": "eq", "value": "equity"}
+            whenever the question is about stocks.
         sort_by: optional allowed column.
         sort_dir: "asc" or "desc".
         limit: max 500.
@@ -557,7 +561,7 @@ def list_etfs() -> list[dict]:
 
 @mcp.tool()
 def get_etf_buy_delta(
-    etf: str, start_date: str, end_date: str
+    etf: str, start_date: str, end_date: str, instrument_type: str = "equity"
 ) -> dict:
     """ETF holdings change between two dates: which stocks were bought / sold.
 
@@ -566,10 +570,15 @@ def get_etf_buy_delta(
         start_date: YYYY-MM-DD (inclusive). If not a trading day, snaps
             backward to the most recent trading day on or before this date.
         end_date: YYYY-MM-DD (inclusive). Same snap-back rule.
+        instrument_type: position type to report. Defaults to "equity" so
+            only listed stocks are returned. Other values: "bond" (for the
+            bond-based ETFs, codes ending in D), "futures", "option",
+            "cash", "fund", "fx", or "all".
 
     Returns:
         {
           "etf": {"code": "00981A", "name": "<official name from meta>"},
+          "instrument_type": "equity",
           "deltas": [
             {"stock_code": "2330", "stock_name": "台積電",
              "delta_shares": 1234567, "delta_value_yi": 42.9,
@@ -584,14 +593,17 @@ def get_etf_buy_delta(
     IMPORTANT: Use the `etf.name` field for the ETF's official name.
     Do not infer the name from training data — names get rebranded.
 
-    Cash markers and futures are excluded.
+    By default only listed-stock positions are returned; bonds, index
+    futures/options, cash and FX markers are excluded.
     """
     with engine.connect() as conn:
-        return mcp_tools.get_etf_buy_delta(conn, etf, start_date, end_date)
+        return mcp_tools.get_etf_buy_delta(
+            conn, etf, start_date, end_date, instrument_type
+        )
 
 
 @mcp.tool()
-def get_etf_holdings(etf: str) -> dict:
+def get_etf_holdings(etf: str, instrument_type: str = "equity") -> dict:
     """Latest current holdings snapshot for one ETF (all stocks, not deltas).
 
     Use this when the question is "what does ETF X currently hold" rather
@@ -599,25 +611,38 @@ def get_etf_holdings(etf: str) -> dict:
 
     Args:
         etf: ETF code, e.g. "00981A".
+        instrument_type: position type to return. Defaults to "equity" so
+            only listed stocks are reported. Other values: "bond" (bond-based
+            ETFs — codes ending in D hold bonds, not stocks), "futures",
+            "option", "cash", "fund", "fx", or "all".
 
     Returns:
         {
           "etf": {"code": "00981A", "name": "<official name>"},
+          "instrument_type": "equity",
           "n_holdings": 47,
           "as_of": "2026-04-30",
+          "other_instrument_types": [
+            {"instrument_type": "futures", "positions": 1, "weight_pct": 5.89}
+          ],
           "holdings": [
             {"stock_code": "2330", "stock_name": "台積電",
              "shares": 12345678, "close": 850.0, "value_yi": 105.0,
              "weight_pct": 28.5, "as_of": "2026-04-30"},
-            ...   # ordered by value desc; entire portfolio (not just top N)
+            ...   # ordered by weight desc; entire equity book (not just top N)
           ]
         }
-    weight_pct sums to ~100%. Cash markers / futures excluded.
+
+    weight_pct is the issuer-published portfolio weight, so the returned rows
+    sum to less than 100% whenever the fund also holds the position types
+    listed in `other_instrument_types` (plus uninvested cash). If
+    `holdings` is empty but `other_instrument_types` is not, the fund is not
+    stock-based — re-call with that instrument_type.
 
     IMPORTANT: Use `etf.name` from response. Don't guess names.
     """
     with engine.connect() as conn:
-        return mcp_tools.get_etf_holdings(conn, etf)
+        return mcp_tools.get_etf_holdings(conn, etf, instrument_type)
 
 
 @mcp.tool()
@@ -635,6 +660,9 @@ def get_stock_history(
     Returns rows ordered by trade_date asc:
         [{"trade_date": "2026-04-01", "share_count": 12345678,
           "close": 1100.0}, ...]
+
+    Looks up exactly the code you pass, with no instrument-type filtering —
+    get the code from get_etf_holdings rather than guessing it.
     """
     with engine.connect() as conn:
         return mcp_tools.get_stock_history(conn, etf, stock_code, days)
@@ -652,7 +680,11 @@ def get_stock_pnl(etf: str, stock_code: str) -> dict:
         {"share_count": <latest>, "close": <latest>,
          "market_value_yi": share_count * close / 1e8 (億 NTD),
          "close_as_of": YYYY-MM-DD, "shares_as_of": YYYY-MM-DD,
-         "is_pnl": false}
+         "instrument_type": "equity", "is_pnl": false}
+
+    Check `instrument_type`: anything other than "equity" (bond, futures,
+    option, cash, fund, fx) is not a listed stock and the valuation does not
+    read as a stock position — `note` says so too.
 
     Use get_stock_unrealized_pnl_estimate when the user asks "賺多少".
     """
@@ -669,9 +701,14 @@ def get_stock_unrealized_pnl_estimate(etf: str, stock_code: str) -> dict:
         stock_code: stock code, e.g. "2327".
 
     Returns estimated current shares, latest close, estimated remaining cost,
-    market value, unrealized P&L, and return %. This is an estimate only:
-    it derives buys/sells from daily share-count deltas and market closes,
-    not real broker lots, fees, taxes, dividends, or issuer trade prices.
+    market value, unrealized P&L, return %, and `instrument_type`. This is an
+    estimate only: it derives buys/sells from daily share-count deltas and
+    market closes, not real broker lots, fees, taxes, dividends, or issuer
+    trade prices.
+
+    The model only applies to listed stocks. If `instrument_type` comes back
+    as anything other than "equity", report the caveat in `note` instead of
+    presenting the numbers as a stock P&L.
     """
     with engine.connect() as conn:
         return mcp_tools.get_stock_unrealized_pnl_estimate(conn, etf, stock_code)
@@ -695,7 +732,8 @@ def get_consensus_buys(
         [{"stock_code": "2330", "stock_name": "台積電",
           "etfs_buying": 5, "total_delta_value_yi": 120.5}, ...]
 
-    Cash markers and futures excluded.
+    Listed stocks only — bonds, index futures/options, cash and FX markers
+    are excluded, since those never overlap meaningfully across issuers.
     """
     with engine.connect() as conn:
         return mcp_tools.get_consensus_buys(

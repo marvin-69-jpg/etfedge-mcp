@@ -16,7 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 
-# Stock_code patterns to exclude from "real stock" queries:
+# Legacy stock_code pattern guard, kept as defence-in-depth behind the
+# instrument_type filter below (covers rows written before the column existed):
 # C_NTD/M_NTD/PFUR_NTD/RDI_NTD = cash-style markers
 # DA_* = multi-currency cash deductions (00998A)
 # ^[0-9]{6}F = futures contracts
@@ -25,6 +26,30 @@ _EXCLUDE_NON_STOCK = (
     "AND stock_code NOT LIKE 'DA\\_%' "
     "AND stock_code !~ '^[0-9]{6}F'"
 )
+
+# `shares` / `holdings` classify every row: listed equities plus bonds (ISIN
+# codes), index futures/options (TX*), cash and FX markers, and fund units.
+# Position tools default to equities so non-stock codes never surface as
+# "holdings"; pass instrument_type explicitly for bond-based ETFs.
+_INSTRUMENT_TYPES = ("equity", "bond", "cash", "futures", "fund", "option", "fx")
+
+
+def _instrument_filter(alias: str, instrument_type: str | None) -> tuple[str, dict]:
+    """Build the instrument_type predicate for a shares/holdings query.
+
+    Returns (sql_predicate, bind_params). ``"all"`` disables the filter
+    (the legacy stock_code guard still applies).
+    """
+    value = str(instrument_type or "equity").strip().lower()
+    if value == "all":
+        return "TRUE", {}
+    if value not in _INSTRUMENT_TYPES:
+        raise ValueError(
+            "instrument_type must be one of: "
+            + ", ".join((*_INSTRUMENT_TYPES, "all"))
+        )
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}instrument_type = :itype", {"itype": value}
 
 _MAX_LIMIT = 500
 _OPS = {
@@ -57,15 +82,26 @@ _DB_TABLES: dict[str, dict[str, Any]] = {
         "date_columns": ["listing_date"],
     },
     "holdings": {
-        "description": "ETF holdings weights by date.",
-        "columns": ["etf_code", "trade_date", "stock_code", "stock_name", "weight_pct"],
+        "description": (
+            "ETF holdings weights by date. Rows cover every position type, "
+            "not just listed stocks — filter instrument_type = 'equity' for "
+            "stock-level analysis."
+        ),
+        "columns": [
+            "etf_code", "trade_date", "stock_code", "stock_name",
+            "weight_pct", "instrument_type",
+        ],
         "date_columns": ["trade_date"],
     },
     "shares": {
-        "description": "ETF holdings shares by date.",
+        "description": (
+            "ETF holdings shares by date. Rows cover every position type, "
+            "not just listed stocks — filter instrument_type = 'equity' for "
+            "stock-level analysis."
+        ),
         "columns": [
             "etf_code", "trade_date", "stock_code", "stock_name",
-            "weight_pct", "share_count", "unit",
+            "weight_pct", "share_count", "unit", "instrument_type",
         ],
         "date_columns": ["trade_date"],
     },
@@ -364,8 +400,13 @@ def _etf_label(conn: Connection, etf: str) -> dict:
 
 
 def get_etf_buy_delta(
-    conn: Connection, etf: str, start_date: str, end_date: str
+    conn: Connection,
+    etf: str,
+    start_date: str,
+    end_date: str,
+    instrument_type: str = "equity",
 ) -> dict:
+    where_instrument, iparams = _instrument_filter("", instrument_type)
     sql = text(
         f"""
         WITH start_snap AS (
@@ -381,6 +422,7 @@ def get_etf_buy_delta(
           SELECT stock_code, stock_name, share_count, trade_date
           FROM shares
           WHERE etf_code = :etf
+            AND {where_instrument}
             AND trade_date = (
               SELECT max(trade_date) FROM shares
               WHERE etf_code = :etf AND trade_date <= :end_date
@@ -413,22 +455,62 @@ def get_etf_buy_delta(
         LIMIT 50
         """
     )
-    rows = [
-        _row_to_dict(r)
-        for r in conn.execute(
-            sql, {"etf": etf, "start_date": start_date, "end_date": end_date}
-        )
-    ]
-    return {"etf": _etf_label(conn, etf), "deltas": rows}
+    params = {
+        "etf": etf,
+        "start_date": start_date,
+        "end_date": end_date,
+        **iparams,
+    }
+    rows = [_row_to_dict(r) for r in conn.execute(sql, params)]
+    return {
+        "etf": _etf_label(conn, etf),
+        "instrument_type": str(instrument_type or "equity").lower(),
+        "deltas": rows,
+    }
 
 
-def get_etf_holdings(conn: Connection, etf: str) -> dict:
-    """Latest holdings snapshot — uses CMoney's official weight_pct from shares."""
+def _latest_shares_date(conn: Connection, etf: str) -> Any:
+    row = conn.execute(
+        text("SELECT max(trade_date) AS d FROM shares WHERE etf_code = :etf"),
+        {"etf": etf},
+    ).first()
+    return row[0] if row else None
+
+
+def _other_instrument_types(
+    conn: Connection, etf: str, as_of: Any, selected: str
+) -> list[dict]:
+    """Position types present in the snapshot but excluded from the result."""
+    if selected == "all" or as_of is None:
+        return []
+    rows = conn.execute(
+        text(
+            """
+            SELECT
+              instrument_type,
+              count(*)::int AS positions,
+              round(sum(weight_pct)::numeric, 2) AS weight_pct
+            FROM shares
+            WHERE etf_code = :etf AND trade_date = :as_of
+              AND instrument_type <> :itype
+            GROUP BY instrument_type
+            ORDER BY positions DESC
+            """
+        ),
+        {"etf": etf, "as_of": as_of, "itype": selected},
+    )
+    return [_row_to_dict(r) for r in rows]
+
+
+def get_etf_holdings(
+    conn: Connection, etf: str, instrument_type: str = "equity"
+) -> dict:
+    """Latest holdings snapshot — uses the issuer-published weight_pct from shares."""
+    where_instrument, iparams = _instrument_filter("s", instrument_type)
+    selected = str(instrument_type or "equity").strip().lower()
+    as_of = _latest_shares_date(conn, etf)
     sql = text(
         f"""
-        WITH latest AS (
-          SELECT max(trade_date) AS d FROM shares WHERE etf_code = :etf
-        )
         SELECT
           s.stock_code,
           s.stock_name,
@@ -440,16 +522,26 @@ def get_etf_holdings(conn: Connection, etf: str) -> dict:
         FROM shares s
         LEFT JOIN prices p USING (stock_code, trade_date)
         WHERE s.etf_code = :etf
-          AND s.trade_date = (SELECT d FROM latest)
+          AND s.trade_date = :as_of
+          AND {where_instrument}
           AND {_EXCLUDE_NON_STOCK.replace('stock_code', 's.stock_code')}
         ORDER BY s.weight_pct DESC NULLS LAST
         """
     )
-    rows = [_row_to_dict(r) for r in conn.execute(sql, {"etf": etf})]
+    rows: list[dict] = []
+    if as_of is not None:
+        rows = [
+            _row_to_dict(r)
+            for r in conn.execute(sql, {"etf": etf, "as_of": as_of, **iparams})
+        ]
     return {
         "etf": _etf_label(conn, etf),
+        "instrument_type": selected,
         "n_holdings": len(rows),
-        "as_of": rows[0]["as_of"] if rows else None,
+        "as_of": as_of.isoformat() if as_of is not None else None,
+        "other_instrument_types": _other_instrument_types(
+            conn, etf, as_of, selected
+        ),
         "holdings": rows,
     }
 
@@ -491,7 +583,7 @@ def get_stock_pnl(conn: Connection, etf: str, stock_code: str) -> dict:
     sql = text(
         """
         WITH latest_share AS (
-          SELECT share_count, trade_date
+          SELECT share_count, trade_date, instrument_type
           FROM shares
           WHERE etf_code = :etf AND stock_code = :stock_code
           ORDER BY trade_date DESC LIMIT 1
@@ -507,7 +599,8 @@ def get_stock_pnl(conn: Connection, etf: str, stock_code: str) -> dict:
           lc.close,
           round(ls.share_count * lc.close / 1e8, 2) AS market_value_yi,
           lc.trade_date AS close_as_of,
-          ls.trade_date AS shares_as_of
+          ls.trade_date AS shares_as_of,
+          ls.instrument_type
         FROM latest_share ls, latest_close lc
         """
     )
@@ -519,6 +612,7 @@ def get_stock_pnl(conn: Connection, etf: str, stock_code: str) -> dict:
             "market_value_yi": 0,
             "close_as_of": None,
             "shares_as_of": None,
+            "instrument_type": None,
             "is_pnl": False,
             "note": "no data found for this etf+stock pair",
         }
@@ -528,6 +622,12 @@ def get_stock_pnl(conn: Connection, etf: str, stock_code: str) -> dict:
         "legacy valuation tool: returns current market value only. "
         "Use get_stock_unrealized_pnl_estimate for estimated P&L."
     )
+    if result.get("instrument_type") != "equity":
+        result["note"] += (
+            f" This position is instrument_type="
+            f"{result.get('instrument_type')!r}, not a listed stock — "
+            "share_count and close are not directly comparable to equities."
+        )
     return result
 
 
@@ -592,6 +692,7 @@ def get_stock_unrealized_pnl_estimate(
         SELECT
           s.trade_date,
           s.stock_name,
+          s.instrument_type,
           s.share_count::numeric AS share_count,
           px.close
         FROM shares s
@@ -623,20 +724,30 @@ def get_stock_unrealized_pnl_estimate(
             "etf": _etf_label(conn, etf),
             "stock_code": stock_code,
             "stock_name": rows[-1]["stock_name"] if rows else None,
+            "instrument_type": rows[-1].get("instrument_type") if rows else None,
             "note": "no data found for this etf+stock pair",
         }
 
+    instrument_type = rows[-1].get("instrument_type")
+    note = (
+        "Estimate only: uses daily share-count deltas and market closes, "
+        "not broker lots, fees, taxes, dividends, or issuer trade prices."
+    )
+    if instrument_type != "equity":
+        note += (
+            f" This position is instrument_type={instrument_type!r}, not a "
+            "listed stock — the cost/P&L model assumes equity share counts "
+            "and does not apply."
+        )
     result = _estimate_unrealized_pnl(rows, latest.close, latest.trade_date)
     result.update({
         "etf": _etf_label(conn, etf),
         "stock_code": stock_code,
         "stock_name": rows[-1]["stock_name"],
+        "instrument_type": instrument_type,
         "shares_as_of": rows[-1]["trade_date"].isoformat(),
         "first_seen": rows[0]["trade_date"].isoformat(),
-        "note": (
-            "Estimate only: uses daily share-count deltas and market closes, "
-            "not broker lots, fees, taxes, dividends, or issuer trade prices."
-        ),
+        "note": note,
     })
     return result
 
@@ -658,12 +769,15 @@ def get_consensus_buys(
           )
         ),
         per_etf_end AS (
+          -- Cross-ETF consensus is a listed-stock concept: bonds/futures/
+          -- options/cash never overlap meaningfully across issuers.
           SELECT s.etf_code, s.stock_code, s.stock_name, s.share_count
           FROM shares s
-          WHERE s.trade_date = (
-            SELECT max(trade_date) FROM shares s2
-            WHERE s2.etf_code = s.etf_code AND s2.trade_date <= :end_date
-          )
+          WHERE s.instrument_type = 'equity'
+            AND s.trade_date = (
+              SELECT max(trade_date) FROM shares s2
+              WHERE s2.etf_code = s.etf_code AND s2.trade_date <= :end_date
+            )
         ),
         deltas AS (
           SELECT

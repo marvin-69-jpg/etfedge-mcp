@@ -89,7 +89,7 @@ Config 路徑：
 | `get_data_freshness` | 查看各資料集最新日期與筆數 |
 | `list_etfs` | 列出所有主動 ETF（代號、名稱、AUM、最新持股數） |
 | `get_etf_buy_delta` | 取得某 ETF 今日加減碼股票（張數變化 + 市值） |
-| `get_etf_holdings` | 取得某 ETF 最新完整持股明細 |
+| `get_etf_holdings` | 取得某 ETF 最新完整持股明細（上市股票） |
 | `get_stock_history` | 取得某 ETF 某股票的歷史持股張數 |
 | `get_stock_pnl` | Legacy：取得某 ETF 某股票的目前市值，不是真實損益 |
 | `get_stock_unrealized_pnl_estimate` | 用每日股數變化與收盤價估算某 ETF 某股票的未實現損益 |
@@ -97,6 +97,11 @@ Config 路徑：
 
 `query_table` 不提供 raw SQL。`prices` 必須帶 `stock_code` 或 `trade_date`
 filter，所有 table 查詢都限制在 allowlist 欄位且 `limit` 最高 500。
+
+持股類 tool（`get_etf_holdings` / `get_etf_buy_delta`）預設只回上市股票
+（`instrument_type = 'equity'`），債券、期貨、選擇權、現金與外匯部位不會混入；
+債券型 ETF（代號結尾 `D`）請帶 `instrument_type="bond"`，要看完整投資組合帶
+`instrument_type="all"`。`get_consensus_buys` 固定只算股票。
 
 ## Auth
 
