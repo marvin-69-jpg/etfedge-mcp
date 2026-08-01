@@ -17,9 +17,21 @@ jobs:
       - name: Deploy to Zeabur
         env:
           ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
+          # Falls back to the known service id so a missing secret cannot
+          # silently deploy nothing.
+          SERVICE_ID: ${{ secrets.MCP_SERVICE_ID || '69f6fc2c7464eddcb1ee8082' }}
         run: |
+          set -euo pipefail
+          # `zeabur auth login` logs ERROR but still exits 0 when the token is
+          # empty, then falls back to an interactive browser login that cannot
+          # work on a runner — which is how this job reported green while
+          # deploying nothing from 2026-06 to 2026-08. Fail loudly instead.
+          if [ -z "${ZEABUR_TOKEN:-}" ]; then
+            echo "::error::ZEABUR_TOKEN secret is not set — nothing was deployed."
+            exit 1
+          fi
           npx zeabur@latest auth login --token "$ZEABUR_TOKEN" -i=false
           npx zeabur@latest deploy \
             --project-id 69ef1de69d832fcd98bfa9d2 \
-            --service-id ${{ secrets.MCP_SERVICE_ID }} \
+            --service-id "$SERVICE_ID" \
             -i=false
