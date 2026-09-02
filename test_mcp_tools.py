@@ -21,6 +21,7 @@ def _raises(fn, text):
 
 def test_table_safety_helpers():
     _raises(lambda: mcp_tools._table("admin_sessions"), "not allowed")
+    _raises(lambda: mcp_tools._table("premium"), "not allowed")
     _raises(lambda: mcp_tools._where("prices", []), "requires")
     _raises(
         lambda: mcp_tools._where(
@@ -40,8 +41,26 @@ def test_table_safety_helpers():
     )
     assert where == "WHERE stock_code = :v0"
     assert params == {"v0": "2330"}
-    assert mcp_tools._limit(999) == 500
+    _raises(lambda: mcp_tools._limit(501), "must not exceed 500")
+    assert mcp_tools._limit(500) == 500
     assert mcp_tools._limit(0) == 100
+
+
+def test_migration_head_fund_contract():
+    assert "premium" not in mcp_tools._DB_TABLES
+    assert mcp_tools._DB_TABLES["fund_metrics"]["columns"] == [
+        "etf_code", "as_of_date", "source", "source_adapter",
+        "units_outstanding", "nav", "total_nav_twd", "created_at", "updated_at",
+    ]
+    assert mcp_tools._DB_TABLES["fund_metrics_resolved"]["columns"] == [
+        "etf_code", "as_of_date", "source", "units_outstanding", "nav",
+        "total_nav_twd", "source_adapter",
+    ]
+    assert mcp_tools._DB_TABLES["fund_flow_daily"]["columns"] == [
+        "etf_code", "as_of_date", "source", "units_outstanding", "nav",
+        "total_nav_twd", "prev_as_of_date", "units_delta", "creation_ntd",
+        "source_adapter",
+    ]
 
 
 def test_instrument_filter_defaults_to_equity():
@@ -63,6 +82,11 @@ def test_instrument_filter_defaults_to_equity():
 class _Rows(list):
     def first(self):
         return self[0] if self else None
+
+
+class _MappedRow:
+    def __init__(self, **values):
+        self._mapping = values
 
 
 class _RecordingConn:
@@ -132,10 +156,116 @@ def test_query_table_uses_safe_sql_parts():
         filters=[{"column": "etf_code", "op": "eq", "value": "00981A"}],
         sort_by="trade_date",
         sort_dir="desc",
-        limit=999,
+        limit=500,
     ) == []
     assert "FROM shares WHERE etf_code = :v0 ORDER BY trade_date DESC" in conn.sql
     assert conn.params == {"v0": "00981A", "limit": 500, "offset": 0}
+
+
+def test_fund_relations_are_bounded_and_parameterized():
+    conn = _Conn()
+    assert mcp_tools.query_table(
+        conn,
+        "fund_metrics",
+        filters=[
+            {"column": "etf_code", "op": "eq", "value": "00981A"},
+            {"column": "as_of_date", "op": "gte", "value": "2026-08-01"},
+        ],
+        sort_by="as_of_date",
+        sort_dir="desc",
+    ) == []
+    assert "FROM fund_metrics WHERE etf_code = :v0 AND as_of_date >= :v1" in conn.sql
+    assert conn.params["v0"] == "00981A"
+    assert conn.params["v1"] == "2026-08-01"
+
+    assert mcp_tools.query_table(
+        conn,
+        "fund_flow_daily",
+        filters=[{"column": "as_of_date", "op": "gte", "value": "2026-08-01"}],
+    ) == []
+    assert (
+        "SELECT etf_code, as_of_date, source, units_outstanding, nav, "
+        "total_nav_twd, prev_as_of_date, units_delta, creation_ntd, source_adapter "
+        "FROM fund_flow_daily WHERE as_of_date >= :v0"
+    ) in conn.sql
+
+    assert mcp_tools.query_table(
+        conn,
+        "fund_metrics_resolved",
+        filters=[{"column": "etf_code", "op": "eq", "value": "00981A"}],
+    ) == []
+    assert "FROM fund_metrics_resolved WHERE etf_code = :v0" in conn.sql
+
+    for table in ("fund_metrics", "fund_metrics_resolved", "fund_flow_daily"):
+        _raises(lambda table=table: mcp_tools._where(table, []), "requires")
+        _raises(
+            lambda table=table: mcp_tools._where(
+                table,
+                [
+                    {"column": "etf_code", "op": "eq", "value": "00981A"},
+                    {"column": "not_a_column", "op": "eq", "value": "x"},
+                ],
+            ),
+            "not allowed",
+        )
+        _raises(
+            lambda table=table: mcp_tools._where(
+                table, [{"column": "etf_code", "op": "regex", "value": "00981A"}]
+            ),
+            "unsupported",
+        )
+    _raises(
+        lambda: mcp_tools.query_table(
+            conn,
+            "fund_metrics",
+            filters=[{"column": "etf_code", "op": "eq", "value": "00981A"}],
+            limit=501,
+        ),
+        "must not exceed 500",
+    )
+
+
+class _RelationConn:
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, sql, params=None):
+        statement = str(sql)
+        self.statements.append((statement, params or {}))
+        if "information_schema.tables" in statement:
+            return _Rows([
+                ("fund_metrics", "BASE TABLE"),
+                ("fund_metrics_resolved", "VIEW"),
+                ("fund_flow_daily", "VIEW"),
+                ("private_unlisted_view", "VIEW"),
+            ])
+        if "information_schema.columns" in statement:
+            return _Rows([])
+        if "max(as_of_date)" in statement:
+            return _Rows([_MappedRow(latest=date(2026, 8, 31), row_count=3)])
+        return _Rows([_MappedRow(latest=None, row_count=0)])
+
+
+def test_allowlisted_views_are_listed_described_and_fresh():
+    conn = _RelationConn()
+    relations = mcp_tools.list_db_tables(conn)
+    assert [item["table"] for item in relations if item["relation_type"] == "view"] == [
+        "fund_metrics_resolved", "fund_flow_daily"
+    ]
+    assert "premium" not in [item["table"] for item in relations]
+
+    described = mcp_tools.describe_table(conn, "fund_flow_daily")
+    assert described["allowed_columns"] == mcp_tools._DB_TABLES["fund_flow_daily"]["columns"]
+    assert described["allowed_columns"] == [
+        "etf_code", "as_of_date", "source", "units_outstanding", "nav",
+        "total_nav_twd", "prev_as_of_date", "units_delta", "creation_ntd",
+        "source_adapter",
+    ]
+
+    freshness = mcp_tools.get_data_freshness(conn)
+    assert {item["table"] for item in freshness} >= {
+        "fund_metrics", "fund_metrics_resolved", "fund_flow_daily"
+    }
 
 
 def test_unrealized_pnl_estimate_weighted_average():
@@ -212,9 +342,12 @@ def test_unrealized_pnl_estimate_uses_latest_non_null_close():
 
 if __name__ == "__main__":
     test_table_safety_helpers()
+    test_migration_head_fund_contract()
     test_instrument_filter_defaults_to_equity()
     test_position_tools_filter_non_equity_by_default()
     test_shares_and_holdings_expose_instrument_type_column()
     test_query_table_uses_safe_sql_parts()
+    test_fund_relations_are_bounded_and_parameterized()
+    test_allowlisted_views_are_listed_described_and_fresh()
     test_unrealized_pnl_estimate_weighted_average()
     test_unrealized_pnl_estimate_uses_latest_non_null_close()

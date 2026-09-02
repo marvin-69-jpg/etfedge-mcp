@@ -105,10 +105,48 @@ _DB_TABLES: dict[str, dict[str, Any]] = {
         ],
         "date_columns": ["trade_date"],
     },
-    "premium": {
-        "description": "ETF close, NAV, and premium/discount by date.",
-        "columns": ["etf_code", "trade_date", "close_price", "nav", "premium_pct"],
-        "date_columns": ["trade_date"],
+    "fund_metrics": {
+        "description": (
+            "Owner-only ETF unit, NAV, and total-net-asset observations by "
+            "portfolio as_of_date and source. as_of_date is the shifted "
+            "portfolio date; created_at and updated_at are ingest metadata, "
+            "not publication timestamps."
+        ),
+        "columns": [
+            "etf_code", "as_of_date", "source", "source_adapter",
+            "units_outstanding", "nav", "total_nav_twd", "created_at", "updated_at",
+        ],
+        "date_columns": ["as_of_date", "created_at", "updated_at"],
+        "requires_filter": True,
+        "required_filter_columns": {"etf_code", "as_of_date"},
+    },
+    "fund_metrics_resolved": {
+        "description": (
+            "Derived ETF metric series that prefers official observations and "
+            "falls back to cmoney. Requires an ETF code or portfolio date filter."
+        ),
+        "columns": [
+            "etf_code", "as_of_date", "source", "units_outstanding", "nav",
+            "total_nav_twd", "source_adapter",
+        ],
+        "date_columns": ["as_of_date"],
+        "requires_filter": True,
+        "required_filter_columns": {"etf_code", "as_of_date"},
+    },
+    "fund_flow_daily": {
+        "description": (
+            "Derived daily units and creation/redemption proxy from the resolved "
+            "metric series. units_delta and creation_ntd are not confirmed issuer "
+            "cash flows."
+        ),
+        "columns": [
+            "etf_code", "as_of_date", "source", "units_outstanding", "nav",
+            "total_nav_twd", "prev_as_of_date", "units_delta", "creation_ntd",
+            "source_adapter",
+        ],
+        "date_columns": ["as_of_date"],
+        "requires_filter": True,
+        "required_filter_columns": {"etf_code", "as_of_date"},
     },
     "dividend": {
         "description": "ETF dividend records.",
@@ -200,7 +238,10 @@ def _column(table: str, column: str) -> str:
 
 
 def _limit(value: int) -> int:
-    return max(1, min(int(value or 100), _MAX_LIMIT))
+    limit = int(value or 100)
+    if limit > _MAX_LIMIT:
+        raise ValueError(f"limit must not exceed {_MAX_LIMIT}")
+    return max(1, limit)
 
 
 def _where(table: str, filters: list[dict] | None) -> tuple[str, dict[str, Any]]:
@@ -241,12 +282,12 @@ def _where(table: str, filters: list[dict] | None) -> tuple[str, dict[str, Any]]
 
 def list_db_tables(conn: Connection) -> list[dict]:
     existing = {
-        r[0]
+        r[0]: r[1]
         for r in conn.execute(text(
             """
-            SELECT table_name
+            SELECT table_name, table_type
             FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            WHERE table_schema = 'public' AND table_type IN ('BASE TABLE', 'VIEW')
             """
         ))
     }
@@ -256,6 +297,7 @@ def list_db_tables(conn: Connection) -> list[dict]:
             "description": spec["description"],
             "columns": len(spec["columns"]),
             "requires_filter": bool(spec.get("requires_filter")),
+            "relation_type": existing[name].lower(),
         }
         for name, spec in _DB_TABLES.items()
         if name in existing
